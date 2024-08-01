@@ -1,5 +1,7 @@
-use byteorder::{BigEndian, LittleEndian, NativeEndian, WriteBytesExt};
+use byteorder::{BigEndian, LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
+use hex;
 use std::error::Error;
+use std::io::Cursor;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
@@ -7,6 +9,7 @@ use std::time::Duration;
 
 use super::db::consts;
 use super::db::DataType;
+use super::err;
 
 pub struct Type3E {
     pub plc_type: &'static str,
@@ -147,54 +150,156 @@ impl Type3E {
             let subheader_hex = format!("{:04X}", self.subheader);
             mc_data.extend_from_slice(subheader_hex.as_bytes());
         }
-        // mc_data.extend_from_slice(&self.encode_value(self.network, consts::DT::BIT)?);
-        // mc_data.extend_from_slice(&self.encode_value(self.pc, consts::DT::BIT)?);
-        // mc_data.extend_from_slice(&self.encode_value(self.dest_moduleio, consts::DT::SWORD)?);
-        // mc_data.extend_from_slice(&self.encode_value(self.dest_modulesta, consts::DT::BIT)?);
-        // mc_data.extend_from_slice(&self.encode_value(
-        //     (self._wordsize + request_data.len() as usize) as u16,
-        //     consts::DT::SWORD,
-        // )?);
-        // mc_data.extend_from_slice(&self.encode_value(self.timer, consts::DT::SWORD)?);
+        mc_data.extend_from_slice(&self.encode_value(self.network as i64, DataType::BIT, false)?);
+        mc_data.extend_from_slice(&self.encode_value(self.pc as i64, DataType::BIT, false)?);
+        mc_data.extend_from_slice(&self.encode_value(
+            self.dest_moduleio as i64,
+            DataType::SWORD,
+            false,
+        )?);
+        mc_data.extend_from_slice(&self.encode_value(
+            self.dest_modulesta as i64,
+            DataType::BIT,
+            false,
+        )?);
+        mc_data.extend_from_slice(&self.encode_value(
+            (self._wordsize + request_data.len() as usize) as i64,
+            DataType::SWORD,
+            false,
+        )?);
+        mc_data.extend_from_slice(&self.encode_value(self.timer as i64, DataType::SWORD, false)?);
         mc_data.extend_from_slice(request_data);
-
         Ok(mc_data)
     }
 
     fn build_command_data(&self, command: u16, subcommand: u16) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut command_data = Vec::new();
-        command_data.extend_from_slice(&self.encode_value(command as i64, DataType::SWORD)?);
-        command_data.extend_from_slice(&self.encode_value(subcommand as i64, DataType::SWORD)?);
+        command_data.extend_from_slice(&self.encode_value(
+            command as i64,
+            DataType::SWORD,
+            false,
+        )?);
+        command_data.extend_from_slice(&self.encode_value(
+            subcommand as i64,
+            DataType::SWORD,
+            false,
+        )?);
         Ok(command_data)
     }
 
-    fn encode_value(&self, value: i64, mode: DataType) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn encode_value(
+        &self,
+        value: i64,
+        mode: DataType,
+        is_signal: bool,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut buffer = Vec::new();
 
         let mode_size = mode.size();
-        match self.endian {
-            &consts::ENDIAN_LITTLE => match mode_size {
+        match *self.endian {
+            consts::ENDIAN_LITTLE => match mode_size {
                 2 => buffer.write_u8(value as u8)?,
-                4 => buffer.write_u16::<LittleEndian>(value as u16)?,
-                8 => buffer.write_u32::<LittleEndian>(value as u32)?,
+                4 => match is_signal {
+                    true => buffer.write_i16::<LittleEndian>(value as i16)?,
+                    false => buffer.write_u16::<LittleEndian>(value as u16)?,
+                },
+                8 => match is_signal {
+                    true => buffer.write_i32::<LittleEndian>(value as i32)?,
+                    false => buffer.write_u32::<LittleEndian>(value as u32)?,
+                },
                 _ => return Err("Unsupported data type size".into()),
             },
-            &consts::ENDIAN_BIG => match mode_size {
+            consts::ENDIAN_BIG => match mode_size {
                 2 => buffer.write_u8(value as u8)?,
-                4 => buffer.write_u16::<BigEndian>(value as u16)?,
-                8 => buffer.write_u32::<BigEndian>(value as u32)?,
+                4 => match is_signal {
+                    true => buffer.write_i32::<BigEndian>(value as i32)?,
+                    false => buffer.write_u32::<BigEndian>(value as u32)?,
+                },
+                8 => match is_signal {
+                    true => buffer.write_i32::<BigEndian>(value as i32)?,
+                    false => buffer.write_u32::<BigEndian>(value as u32)?,
+                },
                 _ => return Err("Unsupported data type size".into()),
             },
-            &consts::ENDIAN_NATIVE => match mode_size {
+            consts::ENDIAN_NATIVE => match mode_size {
                 2 => buffer.write_u8(value as u8)?,
-                4 => buffer.write_u16::<NativeEndian>(value as u16)?,
-                8 => buffer.write_u32::<NativeEndian>(value as u32)?,
+                4 => match is_signal {
+                    true => buffer.write_i64::<NativeEndian>(value as i64)?,
+                    false => buffer.write_u64::<NativeEndian>(value as u64)?,
+                },
+                8 => match is_signal {
+                    true => buffer.write_i64::<NativeEndian>(value as i64)?,
+                    false => buffer.write_u64::<NativeEndian>(value as u64)?,
+                },
                 _ => return Err("Unsupported data type size".into()),
             },
             _ => return Err("Unsupported endianness".into()),
         }
 
         Ok(buffer)
+    }
+
+    fn decode_value(
+        &self,
+        data: &[u8],
+        mode: DataType,
+        is_signed: bool,
+    ) -> Result<i64, Box<dyn Error>> {
+        let mut bytes = data.to_vec();
+        if self.comm_type != consts::COMMTYPE_BINARY {
+            bytes = hex::decode(bytes)?;
+        }
+
+        let mode_size = mode.size();
+        let mut cursor = Cursor::new(bytes);
+        let value = match *self.endian {
+            consts::ENDIAN_LITTLE => match mode_size {
+                2 => cursor.read_u8()? as i64,
+                4 => match is_signed {
+                    true => cursor.read_i16::<LittleEndian>()? as i64,
+                    false => cursor.read_u16::<LittleEndian>()? as i64,
+                },
+                8 => match is_signed {
+                    true => cursor.read_i16::<LittleEndian>()? as i64,
+                    false => cursor.read_u16::<LittleEndian>()? as i64,
+                },
+                _ => return Err("Unsupported data type size".into()),
+            },
+            consts::ENDIAN_BIG => match mode_size {
+                2 => cursor.read_u8()? as i64,
+                4 => match is_signed {
+                    true => cursor.read_i16::<BigEndian>()? as i64,
+                    false => cursor.read_u16::<BigEndian>()? as i64,
+                },
+                8 => match is_signed {
+                    true => cursor.read_i16::<BigEndian>()? as i64,
+                    false => cursor.read_u16::<BigEndian>()? as i64,
+                },
+                _ => return Err("Unsupported data type size".into()),
+            },
+            consts::ENDIAN_NATIVE => match mode_size {
+                2 => cursor.read_u8()? as i64,
+                4 => match is_signed {
+                    true => cursor.read_i16::<NativeEndian>()? as i64,
+                    false => cursor.read_u16::<NativeEndian>()? as i64,
+                },
+                8 => match is_signed {
+                    true => cursor.read_i16::<NativeEndian>()? as i64,
+                    false => cursor.read_u16::<NativeEndian>()? as i64,
+                },
+                _ => return Err("Unsupported data type size".into()),
+            },
+            _ => return Err("Unsupported endianness".into()),
+        };
+        Ok(value)
+    }
+
+    fn check_mc_error(status: u16) -> Result<(), err::MCError> {
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(err::MCError::new(status))
+        }
     }
 }
 
