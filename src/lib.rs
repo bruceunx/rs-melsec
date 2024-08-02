@@ -2,6 +2,7 @@ pub mod db;
 pub mod err;
 pub mod tag;
 pub mod type3e;
+pub mod type4e;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

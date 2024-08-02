@@ -44,7 +44,7 @@ pub struct Type3E {
     pub sock_timeout: u64,
     _is_connected: Arc<Mutex<bool>>,
     _sockbufsize: usize,
-    _wordsize: usize,
+    pub _wordsize: usize,
     _debug: bool,
     endian: &'static char,
     host: String,
@@ -208,7 +208,7 @@ impl Type3E {
         Ok(command_data)
     }
 
-    fn encode_value(
+    pub fn encode_value(
         &self,
         value: i64,
         mode: DataType,
