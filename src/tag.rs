@@ -1,3 +1,4 @@
+use super::db::DataType;
 use std::fmt;
 use std::option::Option;
 
@@ -7,6 +8,12 @@ pub struct Tag {
     pub value: Option<String>,
     pub data_type: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct QueryTag {
+    pub device: String,
+    pub data_type: DataType,
 }
 
 impl Tag {

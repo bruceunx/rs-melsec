@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::db::DataType;
 use super::db::{commands, consts, subcommands, DeviceConstants};
 use super::err;
-use super::tag::Tag;
+use super::tag::{QueryTag, Tag};
 use regex::Regex;
 
 fn get_device_type(device: &str) -> Result<String, String> {
@@ -557,6 +557,76 @@ impl Type3E {
             .unwrap() as u16;
 
         Type3E::check_mc_error(response_status)
+    }
+
+    fn read(&self, devices: Vec<QueryTag>) -> Result<Vec<Tag>, Box<dyn Error>> {
+        let command = commands::RANDOM_READ;
+        let subcommand = if self.plc_type == consts::IQR_SERIES {
+            subcommands::TWO
+        } else {
+            subcommands::ZERO
+        };
+
+        let mut words_count = 0;
+
+        for element in &devices {
+            let _size = element.data_type.size();
+            words_count += _size / 2;
+        }
+
+        let mut request_data = Vec::new();
+        request_data.extend(self.build_command_data(command, subcommand)?);
+        request_data.extend(self.encode_value(words_count as i64, DataType::BIT, false)?);
+        request_data.extend(self.encode_value(0, DataType::BIT, false)?);
+
+        for element in &devices {
+            let element_size = element.data_type.size() / 2;
+            if element_size > 1 {
+                let tag_name = &element.device;
+                let device_type = get_device_type(tag_name)?;
+                let mut device_index = get_device_index(tag_name)?;
+                for _ in 0..element_size {
+                    let temp_tag_name = format!("{}{}", device_type, device_index);
+                    request_data.extend(self.build_device_data(&temp_tag_name)?);
+                    device_index += 1;
+                }
+            } else {
+                request_data.extend(self.build_device_data(&element.device)?);
+            }
+        }
+
+        if words_count < 1 {
+            return Ok(Vec::new());
+        }
+
+        let send_data = self.build_send_data(&request_data)?;
+        self.send(&send_data)?;
+        let recv_data = self.recv()?;
+
+        let mut output = Vec::new();
+        self.check_command_response(&recv_data)?;
+
+        let mut data_index = self.get_response_data_index();
+
+        for element in devices {
+            let size = element.data_type.size();
+            let value = self.decode_value(
+                &recv_data[data_index..data_index + size as usize],
+                &DataType::BIT,
+                false,
+            )?;
+
+            output.push(Tag {
+                device: element.device,
+                value: format!("{}", value).into(),
+                data_type: Some(element.data_type.to_struct_type().to_string()),
+                error: Some("".to_string()),
+            });
+
+            data_index += size as usize;
+        }
+
+        Ok(output)
     }
 }
 
