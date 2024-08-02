@@ -48,7 +48,7 @@ pub mod subcommands {
     pub const F: u16 = 0x000F;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum DataType {
     BIT,
     SWORD,

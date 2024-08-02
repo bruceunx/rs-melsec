@@ -3,10 +3,10 @@ use std::option::Option;
 
 #[derive(Debug)]
 pub struct Tag {
-    device: String,
-    value: Option<String>,
-    data_type: Option<String>,
-    error: Option<String>,
+    pub device: String,
+    pub value: Option<String>,
+    pub data_type: Option<String>,
+    pub error: Option<String>,
 }
 
 impl Tag {

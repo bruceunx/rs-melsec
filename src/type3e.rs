@@ -7,9 +7,30 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::db::consts;
 use super::db::DataType;
+use super::db::{commands, consts, subcommands};
 use super::err;
+use super::tag::Tag;
+use regex::Regex;
+
+fn get_device_type(device: &str) -> Result<String, String> {
+    let re = Regex::new(r"\D+").map_err(|_| "Failed to compile regex".to_string())?;
+    match re.find(device) {
+        Some(mat) => Ok(mat.as_str().to_string()),
+        None => Err(format!("Invalid device type \"{}\"", device)),
+    }
+}
+
+fn get_device_index(device: &str) -> Result<i32, String> {
+    let re = Regex::new(r"\d.*").map_err(|_| "Failed to compile regex".to_string())?;
+    match re.find(device) {
+        Some(mat) => match mat.as_str().parse::<i32>() {
+            Ok(index) => Ok(index),
+            Err(_) => Err(format!("Failed to parse device index \"{}\"", mat.as_str())),
+        },
+        None => Err(format!("Invalid device index \"{}\"", device)),
+    }
+}
 
 pub struct Type3E {
     pub plc_type: &'static str,
@@ -242,7 +263,7 @@ impl Type3E {
     fn decode_value(
         &self,
         data: &[u8],
-        mode: DataType,
+        mode: &DataType,
         is_signed: bool,
     ) -> Result<i64, Box<dyn Error>> {
         let mut bytes = data.to_vec();
@@ -300,6 +321,121 @@ impl Type3E {
         } else {
             Err(err::MCError::new(status))
         }
+    }
+
+    pub fn batch_read(
+        &mut self,
+        ref_device: &str,
+        read_size: usize,
+        data_type: DataType,
+        decode: bool,
+    ) -> Result<Vec<Tag>, Box<dyn Error>> {
+        let data_type_name = data_type.to_struct_type().to_string();
+        let data_type_size = data_type.size();
+        let device_type = get_device_type(ref_device)?;
+        let device_index: i32 = get_device_index(ref_device)?;
+
+        let command = commands::BATCH_READ;
+        let subcommand = if data_type == DataType::BIT {
+            if self.plc_type == consts::IQR_SERIES {
+                subcommands::THREE
+            } else {
+                subcommands::ONE
+            }
+        } else {
+            if self.plc_type == consts::IQR_SERIES {
+                subcommands::TWO
+            } else {
+                subcommands::ZERO
+            }
+        };
+
+        let mut request_data = Vec::new();
+        request_data.extend(self.build_command_data(command, subcommand)?);
+        // request_data.extend(self.build_device_data(ref_device)?);
+        request_data.extend(self.encode_value(
+            (read_size * data_type_size as usize) as i64 / 2,
+            DataType::SWORD,
+            false,
+        )?);
+        let send_data = self.build_send_data(&request_data)?;
+
+        self.send(&send_data)?;
+        let recv_data = self.recv()?;
+        // self.check_command_response(&recv_data)?;
+
+        let mut result = Vec::new();
+        let mut data_index = self.get_response_data_index();
+
+        if data_type == DataType::BIT {
+            if self.comm_type == consts::COMMTYPE_BINARY {
+                for index in 0..read_size {
+                    data_index = index / 2 + data_index;
+                    let bit_value = if decode {
+                        let value = recv_data[data_index];
+                        if index % 2 == 0 {
+                            if (value & (1 << 4)) != 0 {
+                                1
+                            } else {
+                                0
+                            }
+                        } else {
+                            if (value & (1 << 0)) != 0 {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                    } else {
+                        recv_data[data_index] as i32
+                    };
+                    result.push(Tag {
+                        device: format!("{}{}", device_type, device_index + index as i32),
+                        value: format!("{}", bit_value).into(),
+                        data_type: Some(data_type.to_struct_type().to_string()),
+                        error: Some("".to_string()),
+                    });
+                }
+            } else {
+                for index in 0..read_size {
+                    let bit_value = if decode {
+                        recv_data[data_index] as i32
+                    } else {
+                        recv_data[data_index] as i32
+                    };
+                    result.push(Tag {
+                        device: format!("{}{}", device_type, device_index + index as i32),
+                        value: format!("{}", bit_value).into(),
+                        data_type: Some(data_type_name.clone()),
+                        error: Some("".to_string()),
+                    });
+                    data_index += 1;
+                }
+            }
+        } else {
+            for index in 0..read_size {
+                let value = if decode {
+                    let decode_value = self.decode_value(
+                        &recv_data[data_index..data_index + data_type_size as usize].to_vec(),
+                        &data_type,
+                        false,
+                    )?;
+                    format!("{}", decode_value).to_string()
+                } else {
+                    let raw_value = &recv_data[data_index..data_index + data_type_size as usize];
+                    String::from_utf8(raw_value.to_vec())?
+                };
+                result.push(Tag {
+                    device: format!("{}{}", device_type, device_index + index as i32),
+                    value: Some(value),
+                    data_type: Some(data_type_name.clone()),
+                    error: Some("".to_string()),
+                });
+                data_index += data_type_size as usize;
+            }
+        }
+
+        Ok(result)
     }
 }
 
