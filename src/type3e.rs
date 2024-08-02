@@ -1,4 +1,4 @@
-use byteorder::{BigEndian, LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
 use hex;
 use std::error::Error;
 use std::io::Cursor;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::db::DataType;
-use super::db::{commands, consts, subcommands};
+use super::db::{commands, consts, subcommands, DeviceConstants};
 use super::err;
 use super::tag::Tag;
 use regex::Regex;
@@ -352,7 +352,7 @@ impl Type3E {
 
         let mut request_data = Vec::new();
         request_data.extend(self.build_command_data(command, subcommand)?);
-        // request_data.extend(self.build_device_data(ref_device)?);
+        request_data.extend(self.build_device_data(ref_device)?);
         request_data.extend(self.encode_value(
             (read_size * data_type_size as usize) as i64 / 2,
             DataType::SWORD,
@@ -362,7 +362,7 @@ impl Type3E {
 
         self.send(&send_data)?;
         let recv_data = self.recv()?;
-        // self.check_command_response(&recv_data)?;
+        self.check_command_response(&recv_data)?;
 
         let mut result = Vec::new();
         let mut data_index = self.get_response_data_index();
@@ -436,6 +436,127 @@ impl Type3E {
         }
 
         Ok(result)
+    }
+
+    pub fn batch_write(
+        &mut self,
+        ref_device: &str,
+        values: Vec<u32>,
+        data_type: &DataType,
+    ) -> Result<(), Box<dyn Error>> {
+        let data_type_size = data_type.size();
+        let write_elements = values.len();
+
+        let command = commands::BATCH_WRITE;
+        let subcommand = if *data_type == DataType::BIT {
+            if self.plc_type == consts::IQR_SERIES {
+                subcommands::THREE
+            } else {
+                subcommands::ONE
+            }
+        } else {
+            if self.plc_type == consts::IQR_SERIES {
+                subcommands::TWO
+            } else {
+                subcommands::ZERO
+            }
+        };
+
+        let mut request_data = Vec::new();
+        request_data.extend(self.build_command_data(command, subcommand)?);
+        request_data.extend(self.build_device_data(ref_device)?);
+        request_data.extend(self.encode_value(
+            (write_elements * data_type_size as usize) as i64 / 2,
+            DataType::SWORD,
+            false,
+        )?);
+
+        if *data_type == DataType::BIT {
+            if self.comm_type == consts::COMMTYPE_BINARY {
+                let mut bit_data = vec![0; (values.len() + 1) / 2];
+                for (index, value) in values.iter().enumerate() {
+                    let value = (*value != 0) as u8;
+                    let value_index = index / 2;
+                    let bit_index = if index % 2 == 0 { 4 } else { 0 };
+                    let bit_value = value << bit_index;
+                    bit_data[value_index] |= bit_value;
+                }
+                request_data.extend(bit_data);
+            } else {
+                for value in values {
+                    request_data.extend(value.to_string().into_bytes());
+                }
+            }
+        } else {
+            for value in values {
+                request_data.extend(self.encode_value(value as i64, data_type.clone(), false)?);
+            }
+        }
+
+        let send_data = self.build_send_data(&request_data)?;
+
+        self.send(&send_data)?;
+        let recv_data = self.recv()?;
+        self.check_command_response(&recv_data)?;
+        Ok(())
+    }
+
+    fn build_device_data(&self, device: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut device_data = Vec::new();
+
+        let device_type = get_device_type(device)?;
+
+        if self.comm_type == consts::COMMTYPE_BINARY {
+            let (device_code, device_base) =
+                DeviceConstants::get_binary_device_code(self.plc_type, &device_type)?;
+            let device_number =
+                i32::from_str_radix(&get_device_index(device)?.to_string(), device_base)?;
+
+            if self.plc_type == consts::IQR_SERIES {
+                let mut buf = [0u8; 6];
+                if *self.endian == consts::ENDIAN_LITTLE {
+                    LittleEndian::write_u32(&mut buf, device_number as u32);
+                } else {
+                    BigEndian::write_u32(&mut buf, device_number as u32);
+                }
+                device_data.extend_from_slice(&buf[0..4]);
+                device_data.extend_from_slice(&buf[4..6]);
+            } else {
+                let mut buf = [0u8; 4];
+                if *self.endian == consts::ENDIAN_LITTLE {
+                    LittleEndian::write_u32(&mut buf, device_number as u32);
+                } else {
+                    BigEndian::write_u32(&mut buf, device_number as u32);
+                }
+                device_data.extend_from_slice(&buf[0..3]);
+                device_data.push(device_code as u8);
+            }
+        } else {
+            let (device_code, device_base) =
+                DeviceConstants::get_ascii_device_code(self.plc_type, &device_type)?;
+            let device_number = format!(
+                "{:06x}",
+                i32::from_str_radix(&get_device_index(device)?.to_string(), device_base)?
+            );
+
+            device_data.extend_from_slice(device_code.as_bytes());
+            device_data.extend_from_slice(device_number.as_bytes());
+        }
+
+        Ok(device_data)
+    }
+
+    fn check_command_response(&self, recv_data: &[u8]) -> Result<(), err::MCError> {
+        let response_status_index = self.get_response_status_index();
+        let response_status = self
+            .decode_value(
+                &recv_data[response_status_index..response_status_index + self._wordsize],
+                &DataType::SWORD,
+                false,
+            )
+            .unwrap() as u16;
+
+        Type3E::check_mc_error(response_status)
     }
 }
 
