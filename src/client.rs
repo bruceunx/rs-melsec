@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use super::db::DataType;
 use super::db::{commands, consts, subcommands, DeviceConstants};
+use super::device_info::{DeviceInfo, E3, E4};
 use super::err;
 use super::tag::{QueryTag, Tag};
+
 use regex::Regex;
 
 fn get_device_type(device: &str) -> Result<String, String> {
@@ -32,76 +34,6 @@ fn get_device_index(device: &str) -> Result<i32, String> {
     }
 }
 
-struct E3 {
-    subheader: u16,
-}
-
-struct E4 {
-    subheader: u16,
-    subheader_serial: u16,
-}
-
-enum DeviceType {
-    E3(E3),
-    E4(E4),
-}
-
-impl DeviceType {
-    fn get_response_data_index(&self, comm_type: &str) -> usize {
-        match self {
-            DeviceType::E3(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    11
-                } else {
-                    22
-                }
-            }
-            DeviceType::E4(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    15
-                } else {
-                    30
-                }
-            }
-        }
-    }
-
-    fn get_response_status_index(&self, comm_type: &str) -> usize {
-        match self {
-            DeviceType::E3(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    9
-                } else {
-                    18
-                }
-            }
-            DeviceType::E4(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    13
-                } else {
-                    26
-                }
-            }
-        }
-    }
-
-    fn set_subheader_series(&self, subheader_serial: u16) -> Result<DeviceType, &str> {
-        match self {
-            DeviceType::E4(e3) => {
-                if (0..=65535).contains(&subheader_serial) {
-                    Ok(DeviceType::E4(E4 {
-                        subheader: e3.subheader,
-                        subheader_serial,
-                    }))
-                } else {
-                    Err("subheader_serial must be 0 <= subheader_serial <= 65535")
-                }
-            }
-            _ => Err("not implemented"),
-        }
-    }
-}
-
 pub struct Client {
     pub plc_type: &'static str,
     pub comm_type: &'static str,
@@ -111,7 +43,7 @@ pub struct Client {
     pub dest_modulesta: u8,
     pub timer: u8,
     pub sock_timeout: u64,
-    device_type: DeviceType,
+    device_type: Box<dyn DeviceInfo>,
     _is_connected: Arc<Mutex<bool>>,
     _sockbufsize: usize,
     _wordsize: usize,
@@ -120,22 +52,22 @@ pub struct Client {
     host: String,
     port: u16,
     _sock: Option<TcpStream>,
+    use_e4: bool,
 }
 
-#[allow(dead_code)]
 impl Client {
     pub fn new(host: String, port: u16, plc_type: &'static str, use_e4: bool) -> Self {
-        let device_type = if use_e4 {
-            DeviceType::E4(E4 {
+        let device_type: Box<dyn DeviceInfo> = if use_e4 {
+            Box::new(E4 {
                 subheader: 0x5400,
                 subheader_serial: 0x0000,
             })
         } else {
-            DeviceType::E3(E3 { subheader: 0x5000 })
+            Box::new(E3 { subheader: 0x5000 })
         };
 
-        let mut instance = Client {
-            plc_type: consts::Q_SERIES,
+        Client {
+            plc_type,
             comm_type: consts::COMMTYPE_BINARY,
             device_type,
             network: 0,
@@ -152,10 +84,8 @@ impl Client {
             host,
             port,
             _sock: None,
-        };
-
-        instance.set_plc_type(plc_type);
-        instance
+            use_e4,
+        }
     }
 
     pub fn set_debug(&mut self, enable: bool) {
@@ -163,6 +93,7 @@ impl Client {
     }
 
     pub fn connect(&mut self) -> Result<(), Box<dyn Error>> {
+        self.check_plc_type()?;
         let ip_port = format!("{}:{}", self.host, self.port);
         let stream = TcpStream::connect(ip_port)?;
         stream.set_read_timeout(Some(Duration::new(self.sock_timeout, 0)))?;
@@ -173,8 +104,8 @@ impl Client {
         Ok(())
     }
 
-    fn set_subheader_serial(&mut self, subheader_serial: u16) -> Result<(), String> {
-        self.device_type = self.device_type.set_subheader_series(subheader_serial)?;
+    pub fn set_subheader_serial(&mut self, subheader_serial: u16) -> Result<(), String> {
+        self.device_type.set_subheader_series(subheader_serial);
         Ok(())
     }
 
@@ -204,18 +135,14 @@ impl Client {
         Ok(recv_data)
     }
 
-    fn set_plc_type(&mut self, plc_type: &str) {
-        match plc_type {
-            "Q" => self.plc_type = consts::Q_SERIES,
-            "L" => self.plc_type = consts::L_SERIES,
-            "QnA" => self.plc_type = consts::QNA_SERIES,
-            "iQ-L" => self.plc_type = consts::IQL_SERIES,
-            "iQ-R" => self.plc_type = consts::IQR_SERIES,
-            _ => panic!("Failed to set PLC type. Please use 'Q', 'L', 'QnA', 'iQ-L', 'iQ-R'"),
+    fn check_plc_type(&mut self) -> Result<(), String> {
+        match self.plc_type {
+            "Q" | "L" | "QnA" | "iQ-L" | "iQ-R" => Ok(()),
+            _ => Err(format!("Invalid PLC type: {}", self.plc_type)),
         }
     }
 
-    fn set_comm_type(&mut self, comm_type: &str) {
+    pub fn set_comm_type(&mut self, comm_type: &str) {
         match comm_type {
             "binary" => {
                 self.comm_type = consts::COMMTYPE_BINARY;
@@ -232,32 +159,29 @@ impl Client {
     fn build_send_data(&self, request_data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut mc_data = Vec::new();
 
-        match &self.device_type {
-            DeviceType::E3(e3) => {
-                if self.comm_type == consts::COMMTYPE_BINARY {
-                    let mut buffer = Vec::new();
-                    buffer.write_u16::<BigEndian>(e3.subheader)?;
-                    mc_data.extend_from_slice(&buffer);
-                } else {
-                    let subheader_hex = format!("{:04X}", e3.subheader);
-                    mc_data.extend_from_slice(subheader_hex.as_bytes());
-                }
-            }
-            DeviceType::E4(e4) => {
-                if self.comm_type == consts::COMMTYPE_BINARY {
-                    let mut buffer = Vec::new();
-                    buffer.write_u16::<BigEndian>(e4.subheader)?;
-                    mc_data.extend_from_slice(&buffer);
-                } else {
-                    let subheader_hex = format!("{:04X}", e4.subheader);
-                    mc_data.extend_from_slice(subheader_hex.as_bytes());
-                }
-                mc_data.extend_from_slice(&self.encode_value(
-                    e4.subheader_serial as i64,
-                    DataType::SWORD,
-                    false,
-                )?);
-                mc_data.extend_from_slice(&self.encode_value(0, DataType::SWORD, false)?);
+        if self.comm_type == consts::COMMTYPE_BINARY {
+            let mut buffer = Vec::new();
+            buffer.write_u16::<BigEndian>(self.device_type.get_subheader())?;
+            mc_data.extend_from_slice(&buffer);
+        } else {
+            let subheader_hex = format!("{:04X}", self.device_type.get_subheader());
+            mc_data.extend_from_slice(subheader_hex.as_bytes());
+        }
+        mc_data.extend_from_slice(&self.encode_value(
+            self.device_type.get_subheader_serial() as i64,
+            DataType::SWORD,
+            false,
+        )?);
+        mc_data.extend_from_slice(&self.encode_value(0, DataType::SWORD, false)?);
+        if self.use_e4 {
+        } else {
+            if self.comm_type == consts::COMMTYPE_BINARY {
+                let mut buffer = Vec::new();
+                buffer.write_u16::<BigEndian>(self.device_type.get_subheader())?;
+                mc_data.extend_from_slice(&buffer);
+            } else {
+                let subheader_hex = format!("{:04X}", self.device_type.get_subheader());
+                mc_data.extend_from_slice(subheader_hex.as_bytes());
             }
         }
 
@@ -645,7 +569,7 @@ impl Client {
         Client::check_mc_error(response_status)
     }
 
-    fn read(&self, devices: Vec<QueryTag>) -> Result<Vec<Tag>, Box<dyn Error>> {
+    pub fn read(&self, devices: Vec<QueryTag>) -> Result<Vec<Tag>, Box<dyn Error>> {
         let command = commands::RANDOM_READ;
         let subcommand = if self.plc_type == consts::IQR_SERIES {
             subcommands::TWO
@@ -714,7 +638,7 @@ impl Client {
         Ok(output)
     }
 
-    fn write(&self, devices: Vec<Tag>) -> Result<(), Box<dyn Error>> {
+    pub fn write(&self, devices: Vec<Tag>) -> Result<(), Box<dyn Error>> {
         let command = commands::RANDOM_WRITE;
         let subcommand = if self.plc_type == consts::IQR_SERIES {
             subcommands::TWO
@@ -810,5 +734,167 @@ impl std::fmt::Debug for Client {
             .field("host", &self.host)
             .field("port", &self.port)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests_client {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    pub fn start_mock_server(port: u16) -> std::net::SocketAddr {
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let listener = TcpListener::bind(addr).expect("Failed to bind to address");
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("Failed to accept connection");
+                thread::spawn(move || {
+                    let mut buffer = [0; 1024];
+                    loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break, // Connection closed
+                            Ok(size) => {
+                                let received = &buffer[..size];
+                                stream
+                                    .write_all(received)
+                                    .expect("Failed to write to stream");
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    // Mock DeviceInfo implementations for testing
+    struct MockDeviceInfo {
+        subheader: u16,
+        subheader_serial: u16,
+    }
+
+    impl DeviceInfo for MockDeviceInfo {
+        fn set_subheader_series(&mut self, subheader_serial: u16) {
+            self.subheader_serial = subheader_serial;
+        }
+
+        fn get_response_data_index(&self, _: &str) -> usize {
+            10
+        }
+        fn get_response_status_index(&self, _: &str) -> usize {
+            11
+        }
+
+        fn get_subheader(&self) -> u16 {
+            self.subheader
+        }
+        fn get_subheader_serial(&self) -> u16 {
+            self.subheader_serial
+        }
+    }
+
+    #[test]
+    fn test_client_new() {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        assert_eq!(client.host, "localhost");
+        assert_eq!(client.port, 8080);
+        assert_eq!(client.plc_type, "Q");
+        assert!(client.use_e4);
+    }
+
+    #[test]
+    fn test_set_debug() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        client.set_debug(true);
+        assert!(client._debug);
+    }
+
+    #[test]
+    fn test_set_subheader_serial() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        client.device_type = Box::new(MockDeviceInfo {
+            subheader_serial: 0,
+            subheader: 12,
+        });
+        let result = client.set_subheader_serial(1234);
+        assert!(result.is_ok());
+        assert_eq!(client.device_type.get_subheader_serial(), 1234);
+    }
+
+    #[test]
+    fn test_connect() {
+        // This test requires a server running that sends data
+        let server_addr = start_mock_server(9999);
+        let port = server_addr.port();
+        let mut client = Client::new("localhost".to_string(), port, "Q", true);
+        let result = client.connect();
+        assert!(result.is_ok());
+        let data_to_send = b"Hello, server!";
+        let send_result = client.send(data_to_send);
+        assert!(send_result.is_ok());
+        let received_data = client.recv().expect("Failed to receive data");
+        assert_eq!(received_data, data_to_send);
+        let close_result = client.close();
+        assert!(close_result.is_ok());
+    }
+
+    #[test]
+    fn test_check_plc_type() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let result = client.check_plc_type();
+        assert!(result.is_ok());
+
+        client.plc_type = "InvalidType";
+        let result = client.check_plc_type();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_comm_type() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        client.set_comm_type("binary");
+        assert_eq!(client.comm_type, consts::COMMTYPE_BINARY);
+        assert_eq!(client._wordsize, 2);
+
+        client.set_comm_type("ascii");
+        assert_eq!(client.comm_type, consts::COMMTYPE_ASCII);
+        assert_eq!(client._wordsize, 4);
+    }
+    #[test]
+    fn test_build_send_data_binary() -> Result<(), Box<dyn Error>> {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let request_data = b"test";
+        let expected_length = 14;
+        let result = client.build_send_data(request_data)?;
+        assert_eq!(result.len(), expected_length);
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_value_little_endian() -> Result<(), Box<dyn Error>> {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let value = 1234;
+        let encoded = client.encode_value(value as i64, DataType::SWORD, false)?;
+        let mut expected = Vec::new();
+        expected.write_u8(value as u8)?;
+        assert_eq!(encoded, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_value_big_endian() -> Result<(), Box<dyn Error>> {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let value = 1234;
+        let encoded = client.encode_value(value as i64, DataType::SWORD, false)?;
+        let mut expected = Vec::new();
+        expected.write_u8(value as u8)?;
+
+        assert_eq!(encoded, expected);
+        Ok(())
     }
 }
