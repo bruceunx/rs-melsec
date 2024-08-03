@@ -736,3 +736,133 @@ impl std::fmt::Debug for Client {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests_client {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    pub fn start_mock_server(port: u16) -> std::net::SocketAddr {
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let listener = TcpListener::bind(addr).expect("Failed to bind to address");
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("Failed to accept connection");
+                thread::spawn(move || {
+                    let mut buffer = [0; 1024];
+                    loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break, // Connection closed
+                            Ok(size) => {
+                                let received = &buffer[..size];
+                                stream
+                                    .write_all(received)
+                                    .expect("Failed to write to stream");
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    // Mock DeviceInfo implementations for testing
+    struct MockDeviceInfo {
+        subheader: u16,
+        subheader_serial: u16,
+    }
+
+    impl DeviceInfo for MockDeviceInfo {
+        fn set_subheader_series(&mut self, subheader_serial: u16) {
+            self.subheader_serial = subheader_serial;
+        }
+
+        fn get_response_data_index(&self, _: &str) -> usize {
+            10
+        }
+        fn get_response_status_index(&self, _: &str) -> usize {
+            11
+        }
+
+        fn get_subheader(&self) -> u16 {
+            self.subheader
+        }
+        fn get_subheader_serial(&self) -> u16 {
+            self.subheader_serial
+        }
+    }
+
+    #[test]
+    fn test_client_new() {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        assert_eq!(client.host, "localhost");
+        assert_eq!(client.port, 8080);
+        assert_eq!(client.plc_type, "Q");
+        assert!(client.use_e4);
+    }
+
+    #[test]
+    fn test_set_debug() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        client.set_debug(true);
+        assert!(client._debug);
+    }
+
+    #[test]
+    fn test_set_subheader_serial() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        client.device_type = Box::new(MockDeviceInfo {
+            subheader_serial: 0,
+            subheader: 12,
+        });
+        let result = client.set_subheader_serial(1234);
+        assert!(result.is_ok());
+        assert_eq!(client.device_type.get_subheader_serial(), 1234);
+    }
+
+    #[test]
+    fn test_connect() {
+        // This test requires a server running that sends data
+        let server_addr = start_mock_server(9999);
+        let port = server_addr.port();
+        let mut client = Client::new("localhost".to_string(), port, "Q", true);
+        let result = client.connect();
+        assert!(result.is_ok());
+        let data_to_send = b"Hello, server!";
+        let send_result = client.send(data_to_send);
+        assert!(send_result.is_ok());
+        let received_data = client.recv().expect("Failed to receive data");
+        assert_eq!(received_data, data_to_send);
+        let close_result = client.close();
+        assert!(close_result.is_ok());
+    }
+
+    #[test]
+    fn test_check_plc_type() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let result = client.check_plc_type();
+        assert!(result.is_ok());
+
+        client.plc_type = "InvalidType";
+        let result = client.check_plc_type();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_comm_type() {
+        let mut client = Client::new("localhost".to_string(), 8080, "Q", true);
+        client.set_comm_type("binary");
+        assert_eq!(client.comm_type, consts::COMMTYPE_BINARY);
+        assert_eq!(client._wordsize, 2);
+
+        client.set_comm_type("ascii");
+        assert_eq!(client.comm_type, consts::COMMTYPE_ASCII);
+        assert_eq!(client._wordsize, 4);
+    }
+}
