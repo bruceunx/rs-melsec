@@ -865,4 +865,36 @@ mod tests_client {
         assert_eq!(client.comm_type, consts::COMMTYPE_ASCII);
         assert_eq!(client._wordsize, 4);
     }
+    #[test]
+    fn test_build_send_data_binary() -> Result<(), Box<dyn Error>> {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let request_data = b"test";
+        let expected_length = 14;
+        let result = client.build_send_data(request_data)?;
+        assert_eq!(result.len(), expected_length);
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_value_little_endian() -> Result<(), Box<dyn Error>> {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let value = 1234;
+        let encoded = client.encode_value(value as i64, DataType::SWORD, false)?;
+        let mut expected = Vec::new();
+        expected.write_u8(value as u8)?;
+        assert_eq!(encoded, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_value_big_endian() -> Result<(), Box<dyn Error>> {
+        let client = Client::new("localhost".to_string(), 8080, "Q", true);
+        let value = 1234;
+        let encoded = client.encode_value(value as i64, DataType::SWORD, false)?;
+        let mut expected = Vec::new();
+        expected.write_u8(value as u8)?;
+
+        assert_eq!(encoded, expected);
+        Ok(())
+    }
 }
