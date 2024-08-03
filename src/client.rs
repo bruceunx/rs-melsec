@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use super::db::DataType;
 use super::db::{commands, consts, subcommands, DeviceConstants};
+use super::device_info::{DeviceInfo, E3, E4};
 use super::err;
 use super::tag::{QueryTag, Tag};
+
 use regex::Regex;
 
 fn get_device_type(device: &str) -> Result<String, String> {
@@ -32,76 +34,6 @@ fn get_device_index(device: &str) -> Result<i32, String> {
     }
 }
 
-struct E3 {
-    subheader: u16,
-}
-
-struct E4 {
-    subheader: u16,
-    subheader_serial: u16,
-}
-
-enum DeviceType {
-    E3(E3),
-    E4(E4),
-}
-
-impl DeviceType {
-    fn get_response_data_index(&self, comm_type: &str) -> usize {
-        match self {
-            DeviceType::E3(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    11
-                } else {
-                    22
-                }
-            }
-            DeviceType::E4(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    15
-                } else {
-                    30
-                }
-            }
-        }
-    }
-
-    fn get_response_status_index(&self, comm_type: &str) -> usize {
-        match self {
-            DeviceType::E3(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    9
-                } else {
-                    18
-                }
-            }
-            DeviceType::E4(_) => {
-                if comm_type == consts::COMMTYPE_BINARY {
-                    13
-                } else {
-                    26
-                }
-            }
-        }
-    }
-
-    fn set_subheader_series(&self, subheader_serial: u16) -> Result<DeviceType, &str> {
-        match self {
-            DeviceType::E4(e3) => {
-                if (0..=65535).contains(&subheader_serial) {
-                    Ok(DeviceType::E4(E4 {
-                        subheader: e3.subheader,
-                        subheader_serial,
-                    }))
-                } else {
-                    Err("subheader_serial must be 0 <= subheader_serial <= 65535")
-                }
-            }
-            _ => Err("not implemented"),
-        }
-    }
-}
-
 pub struct Client {
     pub plc_type: &'static str,
     pub comm_type: &'static str,
@@ -111,7 +43,7 @@ pub struct Client {
     pub dest_modulesta: u8,
     pub timer: u8,
     pub sock_timeout: u64,
-    device_type: DeviceType,
+    device_type: Box<dyn DeviceInfo>,
     _is_connected: Arc<Mutex<bool>>,
     _sockbufsize: usize,
     _wordsize: usize,
@@ -120,18 +52,19 @@ pub struct Client {
     host: String,
     port: u16,
     _sock: Option<TcpStream>,
+    use_e4: bool,
 }
 
 #[allow(dead_code)]
 impl Client {
     pub fn new(host: String, port: u16, plc_type: &'static str, use_e4: bool) -> Self {
-        let device_type = if use_e4 {
-            DeviceType::E4(E4 {
+        let device_type: Box<dyn DeviceInfo> = if use_e4 {
+            Box::new(E4 {
                 subheader: 0x5400,
                 subheader_serial: 0x0000,
             })
         } else {
-            DeviceType::E3(E3 { subheader: 0x5000 })
+            Box::new(E3 { subheader: 0x5000 })
         };
 
         let mut instance = Client {
@@ -152,6 +85,7 @@ impl Client {
             host,
             port,
             _sock: None,
+            use_e4,
         };
 
         instance.set_plc_type(plc_type);
@@ -174,7 +108,7 @@ impl Client {
     }
 
     fn set_subheader_serial(&mut self, subheader_serial: u16) -> Result<(), String> {
-        self.device_type = self.device_type.set_subheader_series(subheader_serial)?;
+        self.device_type.set_subheader_series(subheader_serial);
         Ok(())
     }
 
@@ -232,32 +166,29 @@ impl Client {
     fn build_send_data(&self, request_data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut mc_data = Vec::new();
 
-        match &self.device_type {
-            DeviceType::E3(e3) => {
-                if self.comm_type == consts::COMMTYPE_BINARY {
-                    let mut buffer = Vec::new();
-                    buffer.write_u16::<BigEndian>(e3.subheader)?;
-                    mc_data.extend_from_slice(&buffer);
-                } else {
-                    let subheader_hex = format!("{:04X}", e3.subheader);
-                    mc_data.extend_from_slice(subheader_hex.as_bytes());
-                }
-            }
-            DeviceType::E4(e4) => {
-                if self.comm_type == consts::COMMTYPE_BINARY {
-                    let mut buffer = Vec::new();
-                    buffer.write_u16::<BigEndian>(e4.subheader)?;
-                    mc_data.extend_from_slice(&buffer);
-                } else {
-                    let subheader_hex = format!("{:04X}", e4.subheader);
-                    mc_data.extend_from_slice(subheader_hex.as_bytes());
-                }
-                mc_data.extend_from_slice(&self.encode_value(
-                    e4.subheader_serial as i64,
-                    DataType::SWORD,
-                    false,
-                )?);
-                mc_data.extend_from_slice(&self.encode_value(0, DataType::SWORD, false)?);
+        if self.comm_type == consts::COMMTYPE_BINARY {
+            let mut buffer = Vec::new();
+            buffer.write_u16::<BigEndian>(self.device_type.get_subheader())?;
+            mc_data.extend_from_slice(&buffer);
+        } else {
+            let subheader_hex = format!("{:04X}", self.device_type.get_subheader());
+            mc_data.extend_from_slice(subheader_hex.as_bytes());
+        }
+        mc_data.extend_from_slice(&self.encode_value(
+            self.device_type.get_subheader_serial() as i64,
+            DataType::SWORD,
+            false,
+        )?);
+        mc_data.extend_from_slice(&self.encode_value(0, DataType::SWORD, false)?);
+        if self.use_e4 {
+        } else {
+            if self.comm_type == consts::COMMTYPE_BINARY {
+                let mut buffer = Vec::new();
+                buffer.write_u16::<BigEndian>(self.device_type.get_subheader())?;
+                mc_data.extend_from_slice(&buffer);
+            } else {
+                let subheader_hex = format!("{:04X}", self.device_type.get_subheader());
+                mc_data.extend_from_slice(subheader_hex.as_bytes());
             }
         }
 
