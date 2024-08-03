@@ -2,6 +2,8 @@
 name = "rs-melsec"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A Rust MELSEC Communication library for communicating with Mitsubishi PLCs"
 
 [dependencies]
 byteorder = "1.5.0"
