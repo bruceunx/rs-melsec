@@ -88,7 +88,7 @@ impl DeviceType {
     fn set_subheader_series(&self, subheader_serial: u16) -> Result<DeviceType, &str> {
         match self {
             DeviceType::E4(e3) => {
-                if (0..=65555).contains(&subheader_serial) {
+                if (0..=65535).contains(&subheader_serial) {
                     Ok(DeviceType::E4(E4 {
                         subheader: e3.subheader,
                         subheader_serial,
@@ -105,13 +105,13 @@ impl DeviceType {
 pub struct Client {
     pub plc_type: &'static str,
     pub comm_type: &'static str,
-    pub device_type: DeviceType,
     pub network: u8,
     pub pc: u8,
     pub dest_moduleio: u16,
     pub dest_modulesta: u8,
     pub timer: u8,
     pub sock_timeout: u64,
+    device_type: DeviceType,
     _is_connected: Arc<Mutex<bool>>,
     _sockbufsize: usize,
     _wordsize: usize,
@@ -226,22 +226,6 @@ impl Client {
                 self._wordsize = 4;
             }
             _ => panic!("Failed to set communication type. Please use 'binary' or 'ascii'"),
-        }
-    }
-
-    fn get_response_data_index(&self) -> usize {
-        if self.comm_type == consts::COMMTYPE_BINARY {
-            11
-        } else {
-            22
-        }
-    }
-
-    fn get_response_status_index(&self) -> usize {
-        if self.comm_type == consts::COMMTYPE_BINARY {
-            9
-        } else {
-            18
         }
     }
 
@@ -470,7 +454,7 @@ impl Client {
         self.check_command_response(&recv_data)?;
 
         let mut result = Vec::new();
-        let mut data_index = self.get_response_data_index();
+        let mut data_index = self.device_type.get_response_data_index(self.comm_type);
 
         if data_type == DataType::BIT {
             if self.comm_type == consts::COMMTYPE_BINARY {
@@ -649,7 +633,7 @@ impl Client {
     }
 
     fn check_command_response(&self, recv_data: &[u8]) -> Result<(), err::MCError> {
-        let response_status_index = self.get_response_status_index();
+        let response_status_index = self.device_type.get_response_status_index(self.comm_type);
         let response_status = self
             .decode_value(
                 &recv_data[response_status_index..response_status_index + self._wordsize],
@@ -708,7 +692,7 @@ impl Client {
         let mut output = Vec::new();
         self.check_command_response(&recv_data)?;
 
-        let mut data_index = self.get_response_data_index();
+        let mut data_index = self.device_type.get_response_data_index(self.comm_type);
 
         for element in devices {
             let size = element.data_type.size();
