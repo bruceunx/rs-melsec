@@ -55,7 +55,6 @@ pub struct Client {
     use_e4: bool,
 }
 
-#[allow(dead_code)]
 impl Client {
     pub fn new(host: String, port: u16, plc_type: &'static str, use_e4: bool) -> Self {
         let device_type: Box<dyn DeviceInfo> = if use_e4 {
@@ -67,8 +66,8 @@ impl Client {
             Box::new(E3 { subheader: 0x5000 })
         };
 
-        let mut instance = Client {
-            plc_type: consts::Q_SERIES,
+        Client {
+            plc_type,
             comm_type: consts::COMMTYPE_BINARY,
             device_type,
             network: 0,
@@ -86,10 +85,7 @@ impl Client {
             port,
             _sock: None,
             use_e4,
-        };
-
-        instance.set_plc_type(plc_type);
-        instance
+        }
     }
 
     pub fn set_debug(&mut self, enable: bool) {
@@ -97,6 +93,7 @@ impl Client {
     }
 
     pub fn connect(&mut self) -> Result<(), Box<dyn Error>> {
+        self.check_plc_type()?;
         let ip_port = format!("{}:{}", self.host, self.port);
         let stream = TcpStream::connect(ip_port)?;
         stream.set_read_timeout(Some(Duration::new(self.sock_timeout, 0)))?;
@@ -107,7 +104,7 @@ impl Client {
         Ok(())
     }
 
-    fn set_subheader_serial(&mut self, subheader_serial: u16) -> Result<(), String> {
+    pub fn set_subheader_serial(&mut self, subheader_serial: u16) -> Result<(), String> {
         self.device_type.set_subheader_series(subheader_serial);
         Ok(())
     }
@@ -138,18 +135,14 @@ impl Client {
         Ok(recv_data)
     }
 
-    fn set_plc_type(&mut self, plc_type: &str) {
-        match plc_type {
-            "Q" => self.plc_type = consts::Q_SERIES,
-            "L" => self.plc_type = consts::L_SERIES,
-            "QnA" => self.plc_type = consts::QNA_SERIES,
-            "iQ-L" => self.plc_type = consts::IQL_SERIES,
-            "iQ-R" => self.plc_type = consts::IQR_SERIES,
-            _ => panic!("Failed to set PLC type. Please use 'Q', 'L', 'QnA', 'iQ-L', 'iQ-R'"),
+    fn check_plc_type(&mut self) -> Result<(), String> {
+        match self.plc_type {
+            "Q" | "L" | "QnA" | "iQ-L" | "iQ-R" => Ok(()),
+            _ => Err(format!("Invalid PLC type: {}", self.plc_type)),
         }
     }
 
-    fn set_comm_type(&mut self, comm_type: &str) {
+    pub fn set_comm_type(&mut self, comm_type: &str) {
         match comm_type {
             "binary" => {
                 self.comm_type = consts::COMMTYPE_BINARY;
@@ -576,7 +569,7 @@ impl Client {
         Client::check_mc_error(response_status)
     }
 
-    fn read(&self, devices: Vec<QueryTag>) -> Result<Vec<Tag>, Box<dyn Error>> {
+    pub fn read(&self, devices: Vec<QueryTag>) -> Result<Vec<Tag>, Box<dyn Error>> {
         let command = commands::RANDOM_READ;
         let subcommand = if self.plc_type == consts::IQR_SERIES {
             subcommands::TWO
@@ -645,7 +638,7 @@ impl Client {
         Ok(output)
     }
 
-    fn write(&self, devices: Vec<Tag>) -> Result<(), Box<dyn Error>> {
+    pub fn write(&self, devices: Vec<Tag>) -> Result<(), Box<dyn Error>> {
         let command = commands::RANDOM_WRITE;
         let subcommand = if self.plc_type == consts::IQR_SERIES {
             subcommands::TWO
