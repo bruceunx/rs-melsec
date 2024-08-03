@@ -32,10 +32,80 @@ fn get_device_index(device: &str) -> Result<i32, String> {
     }
 }
 
-pub struct Type3E {
+struct E3 {
+    subheader: u16,
+}
+
+struct E4 {
+    subheader: u16,
+    subheader_serial: u16,
+}
+
+enum DeviceType {
+    E3(E3),
+    E4(E4),
+}
+
+impl DeviceType {
+    fn get_response_data_index(&self, comm_type: &str) -> usize {
+        match self {
+            DeviceType::E3(_) => {
+                if comm_type == consts::COMMTYPE_BINARY {
+                    11
+                } else {
+                    22
+                }
+            }
+            DeviceType::E4(_) => {
+                if comm_type == consts::COMMTYPE_BINARY {
+                    15
+                } else {
+                    30
+                }
+            }
+        }
+    }
+
+    fn get_response_status_index(&self, comm_type: &str) -> usize {
+        match self {
+            DeviceType::E3(_) => {
+                if comm_type == consts::COMMTYPE_BINARY {
+                    9
+                } else {
+                    18
+                }
+            }
+            DeviceType::E4(_) => {
+                if comm_type == consts::COMMTYPE_BINARY {
+                    13
+                } else {
+                    26
+                }
+            }
+        }
+    }
+
+    fn set_subheader_series(&self, subheader_serial: u16) -> Result<DeviceType, &str> {
+        match self {
+            DeviceType::E4(e3) => {
+                if (0..=65555).contains(&subheader_serial) {
+                    Ok(DeviceType::E4(E4 {
+                        subheader: e3.subheader,
+                        subheader_serial,
+                    }))
+                } else {
+                    Err("subheader_serial must be 0 <= subheader_serial <= 65535")
+                }
+            }
+            _ => Err("not implemented"),
+        }
+    }
+}
+
+pub struct Client {
     pub plc_type: &'static str,
     pub comm_type: &'static str,
-    pub subheader: u16,
+    pub device_type: DeviceType,
     pub network: u8,
     pub pc: u8,
     pub dest_moduleio: u16,
@@ -44,7 +114,7 @@ pub struct Type3E {
     pub sock_timeout: u64,
     _is_connected: Arc<Mutex<bool>>,
     _sockbufsize: usize,
-    pub _wordsize: usize,
+    _wordsize: usize,
     _debug: bool,
     endian: &'static char,
     host: String,
@@ -53,12 +123,21 @@ pub struct Type3E {
 }
 
 #[allow(dead_code)]
-impl Type3E {
-    pub fn new(host: String, port: u16, plc_type: &'static str) -> Self {
-        let mut instance = Type3E {
+impl Client {
+    pub fn new(host: String, port: u16, plc_type: &'static str, use_e4: bool) -> Self {
+        let device_type = if use_e4 {
+            DeviceType::E4(E4 {
+                subheader: 0x5400,
+                subheader_serial: 0x0000,
+            })
+        } else {
+            DeviceType::E3(E3 { subheader: 0x5000 })
+        };
+
+        let mut instance = Client {
             plc_type: consts::Q_SERIES,
             comm_type: consts::COMMTYPE_BINARY,
-            subheader: 0x5000,
+            device_type,
             network: 0,
             pc: 0xFF,
             dest_moduleio: 0x3FF,
@@ -91,6 +170,11 @@ impl Type3E {
         self._sock = Some(stream);
         let mut is_connected = self._is_connected.lock().unwrap();
         *is_connected = true;
+        Ok(())
+    }
+
+    fn set_subheader_serial(&mut self, subheader_serial: u16) -> Result<(), String> {
+        self.device_type = self.device_type.set_subheader_series(subheader_serial)?;
         Ok(())
     }
 
@@ -163,14 +247,36 @@ impl Type3E {
 
     fn build_send_data(&self, request_data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut mc_data = Vec::new();
-        if self.comm_type == consts::COMMTYPE_BINARY {
-            let mut buffer = Vec::new();
-            buffer.write_u16::<BigEndian>(self.subheader)?;
-            mc_data.extend_from_slice(&buffer);
-        } else {
-            let subheader_hex = format!("{:04X}", self.subheader);
-            mc_data.extend_from_slice(subheader_hex.as_bytes());
+
+        match &self.device_type {
+            DeviceType::E3(e3) => {
+                if self.comm_type == consts::COMMTYPE_BINARY {
+                    let mut buffer = Vec::new();
+                    buffer.write_u16::<BigEndian>(e3.subheader)?;
+                    mc_data.extend_from_slice(&buffer);
+                } else {
+                    let subheader_hex = format!("{:04X}", e3.subheader);
+                    mc_data.extend_from_slice(subheader_hex.as_bytes());
+                }
+            }
+            DeviceType::E4(e4) => {
+                if self.comm_type == consts::COMMTYPE_BINARY {
+                    let mut buffer = Vec::new();
+                    buffer.write_u16::<BigEndian>(e4.subheader)?;
+                    mc_data.extend_from_slice(&buffer);
+                } else {
+                    let subheader_hex = format!("{:04X}", e4.subheader);
+                    mc_data.extend_from_slice(subheader_hex.as_bytes());
+                }
+                mc_data.extend_from_slice(&self.encode_value(
+                    e4.subheader_serial as i64,
+                    DataType::SWORD,
+                    false,
+                )?);
+                mc_data.extend_from_slice(&self.encode_value(0, DataType::SWORD, false)?);
+            }
         }
+
         mc_data.extend_from_slice(&self.encode_value(self.network as i64, DataType::BIT, false)?);
         mc_data.extend_from_slice(&self.encode_value(self.pc as i64, DataType::BIT, false)?);
         mc_data.extend_from_slice(&self.encode_value(
@@ -552,7 +658,7 @@ impl Type3E {
             )
             .unwrap() as u16;
 
-        Type3E::check_mc_error(response_status)
+        Client::check_mc_error(response_status)
     }
 
     fn read(&self, devices: Vec<QueryTag>) -> Result<Vec<Tag>, Box<dyn Error>> {
@@ -693,7 +799,7 @@ impl Type3E {
     }
 }
 
-impl Drop for Type3E {
+impl Drop for Client {
     fn drop(&mut self) {
         if let Err(e) = self.close() {
             eprintln!("Error closing connection: {:?}", e);
@@ -701,12 +807,11 @@ impl Drop for Type3E {
     }
 }
 
-impl std::fmt::Debug for Type3E {
+impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Type3E")
             .field("plc_type", &self.plc_type)
             .field("comm_type", &self.comm_type)
-            .field("subheader", &self.subheader)
             .field("network", &self.network)
             .field("pc", &self.pc)
             .field("dest_moduleio", &self.dest_moduleio)
